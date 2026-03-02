@@ -11,14 +11,14 @@ provider "aws" {
 }
 
 locals {
-  name   = "reliability-toolkit-dev"
+  name   = "reliability-toolkit-prod"
   region = var.region
 
-  vpc_cidr = "10.0.0.0/16"
+  vpc_cidr = "10.1.0.0/16" # Separate CIDR from dev to allow VPC peering if needed
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
 
   tags = {
-    Environment = "dev"
+    Environment = "prod"
     Project     = "reliability-toolkit"
     Terraform   = "true"
     ManagedBy   = "terraform"
@@ -29,6 +29,8 @@ data "aws_availability_zones" "available" {}
 
 # ---------------------------------------------------------------------------
 # Network (VPC)
+# Production: per-AZ NAT gateways for egress redundancy.
+# A single NAT gateway is an AZ-level SPOF for all private subnet egress.
 # ---------------------------------------------------------------------------
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
@@ -42,8 +44,9 @@ module "vpc" {
   public_subnets   = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 4)]
   database_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 8)]
 
-  enable_nat_gateway = true
-  single_nat_gateway = true # Dev: single NAT to reduce cost. Set false in prod.
+  enable_nat_gateway  = true
+  single_nat_gateway  = false # Production: one NAT per AZ for redundancy
+  one_nat_gateway_per_az = true
 
   create_database_subnet_group = true
 
@@ -52,23 +55,26 @@ module "vpc" {
 
 # ---------------------------------------------------------------------------
 # Security Groups
-# Dedicated security groups replace the default VPC security group.
-# Each layer (ALB, ECS, Aurora) has explicit, least-privilege rules.
 # ---------------------------------------------------------------------------
 module "security_groups" {
   source = "../../modules/security-groups"
 
   name_prefix    = local.name
   vpc_id         = module.vpc.vpc_id
-  container_port = 80
+  container_port = var.container_port
   tags           = local.tags
 }
 
 # ---------------------------------------------------------------------------
 # Load Balancer
-# Dev: HTTP-only (no certificate_arn). Production sets certificate_arn to
-# an ACM ARN for TLS termination and forces the HTTP→HTTPS redirect.
-# enable_deletion_protection = false allows terraform destroy in dev.
+# Production: enable_deletion_protection = true prevents accidental removal.
+# Set certificate_arn to an ACM certificate covering your domain name.
+# The HTTP listener redirects all port-80 traffic to HTTPS (301).
+#
+# High-availability behaviour:
+#   The ALB nodes are deployed across all 3 AZs listed in var.azs (above).
+#   If an AZ fails, ALB stops routing to targets in that AZ automatically.
+#   New task registrations triggered by ECS autoscaling land in healthy AZs.
 # ---------------------------------------------------------------------------
 module "alb" {
   source = "../../modules/alb"
@@ -77,12 +83,14 @@ module "alb" {
   vpc_id             = module.vpc.vpc_id
   public_subnet_ids  = module.vpc.public_subnets
   security_group_id  = module.security_groups.alb_security_group_id
-  container_port     = 80
+  container_port     = var.container_port
 
-  # Dev: defaults to "" (HTTP-only). Override via var.certificate_arn if you
-  # want to test TLS termination in dev with a real ACM certificate.
-  certificate_arn            = var.certificate_arn
-  enable_deletion_protection = false
+  # Replace with a real ACM ARN:
+  #   aws acm request-certificate --domain-name app.example.com --validation-method DNS
+  certificate_arn = var.certificate_arn
+
+  enable_deletion_protection = true
+  access_log_bucket          = var.alb_access_log_bucket
 
   health_check_path = "/health"
 
@@ -91,20 +99,19 @@ module "alb" {
 
 # ---------------------------------------------------------------------------
 # Observability
+# Production: alarm email is required; Aurora replica lag alarm is enabled.
 # ---------------------------------------------------------------------------
 module "observability" {
   source = "../../modules/observability"
 
-  app_name  = local.name
+  app_name    = local.name
   alarm_email = var.alarm_email
 
-  # ECS alarm dimensions — wired after cluster/service are known
   ecs_cluster_name = aws_ecs_cluster.this.name
   ecs_service_name = "${local.name}-service"
 
-  # Aurora alarm dimensions
   aurora_cluster_id   = module.aurora.cluster_id
-  aurora_has_replicas = false # Dev uses single instance
+  aurora_has_replicas = true # Production has read replicas
 
   # Wire ALB metrics so the 5xx alarm fires correctly.
   alb_arn_suffix          = module.alb.lb_arn_suffix
@@ -115,50 +122,57 @@ module "observability" {
 
 # ---------------------------------------------------------------------------
 # Secrets Manager
-# Stores DB credentials and app secrets; ECS pulls them at task launch so
-# no plaintext credentials ever appear in the task definition or logs.
-#
-# recovery_window_in_days = 0 allows immediate secret deletion on
-# `terraform destroy` in dev. Set to 7–30 in production.
+# Production: 30-day recovery window gives a month to recover from accidental
+# deletion. After the initial seed, rotate credentials using either:
+#   a) AWS-managed Lambda rotation for the Aurora secret, or
+#   b) aws secretsmanager put-secret-value for app secrets.
+# The ECS execution role fetches secrets at task launch — plaintext
+# credentials are never written to task definitions or CloudWatch Logs.
 # ---------------------------------------------------------------------------
 module "secrets" {
   source = "../../modules/secrets"
 
   app_name    = local.name
-  db_username = "postgres"
+  db_username = var.db_username
   db_password = var.db_password
 
-  recovery_window_in_days = 0 # Dev: force-delete on destroy
+  recovery_window_in_days = 30 # Production: 30-day soft-delete window
 
   tags = local.tags
 }
 
 # ---------------------------------------------------------------------------
 # Database
+# Production: Multi-AZ HA (instance_count = 2), deletion protection enabled,
+# enhanced monitoring active, Performance Insights enabled.
 # ---------------------------------------------------------------------------
 module "aurora" {
   source = "../../modules/aurora-postgres"
 
   cluster_name           = "${local.name}-db"
-  db_name                = "appdb"
-  master_username        = "postgres"
+  db_name                = var.db_name
+  master_username        = var.db_username
   master_password        = var.db_password
   vpc_security_group_ids = [module.security_groups.aurora_security_group_id]
   db_subnet_group_name   = module.vpc.database_subnet_group_name
 
-  # Dev overrides: reduce cost and allow teardown
-  instance_count              = 1
-  deletion_protection         = false # Allow terraform destroy in dev
-  skip_final_snapshot         = true
-  monitoring_interval         = 0     # Disable enhanced monitoring in dev
-  performance_insights_enabled = false # Disable to reduce cost in dev
+  # Production HA settings
+  instance_count       = 2           # Writer + 1 read replica for automatic failover
+  instance_class       = var.aurora_instance_class
+  deletion_protection  = true        # Block accidental cluster deletion
+  skip_final_snapshot  = false       # Always take a snapshot before destroy
+  backup_retention_period = 14       # 2-week backup window for production
+
+  # Observability
+  monitoring_interval                  = 60   # Enhanced OS monitoring every 60s
+  performance_insights_enabled         = true
+  performance_insights_retention_period = 7   # 7-day free tier; upgrade to 731 for long-term
 
   tags = local.tags
 }
 
 # ---------------------------------------------------------------------------
 # ECS Cluster
-# Container Insights enabled for memory, network, and disk metrics per task.
 # ---------------------------------------------------------------------------
 resource "aws_ecs_cluster" "this" {
   name = local.name
@@ -173,7 +187,6 @@ resource "aws_ecs_cluster" "this" {
 
 # ---------------------------------------------------------------------------
 # IAM — Task Execution Role
-# Grants ECS the ability to pull images from ECR and write logs to CloudWatch.
 # ---------------------------------------------------------------------------
 resource "aws_iam_role" "execution" {
   name = "${local.name}-execution-role"
@@ -193,9 +206,9 @@ resource "aws_iam_role_policy_attachment" "execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Least-privilege: grant the execution role access to exactly the two secrets
-# this environment owns. The ECS agent (not the application) uses this role
-# to fetch secrets and inject them into the task at launch time.
+# Least-privilege: restrict the execution role to fetching only the two secrets
+# that belong to this environment. A compromised execution role cannot access
+# secrets from other environments or other AWS accounts.
 resource "aws_iam_role_policy" "execution_secrets" {
   name = "${local.name}-secrets-access"
   role = aws_iam_role.execution.id
@@ -217,9 +230,8 @@ resource "aws_iam_role_policy" "execution_secrets" {
 
 # ---------------------------------------------------------------------------
 # IAM — Task Role (Application Role)
-# Grants the running container permissions to call AWS APIs. Scoped to only
-# what the application actually needs. Extend with additional policy
-# attachments for S3, SQS, Secrets Manager, etc. as required.
+# Scope this to the minimal set of permissions your application requires.
+# Extend with additional aws_iam_role_policy_attachment resources as needed.
 # ---------------------------------------------------------------------------
 resource "aws_iam_role" "task" {
   name = "${local.name}-task-role"
@@ -236,6 +248,8 @@ resource "aws_iam_role" "task" {
 
 # ---------------------------------------------------------------------------
 # ECS Service
+# Production: higher autoscaling ceiling, deployment config enforces zero
+# downtime, health check grace period accounts for container warm-up.
 # ---------------------------------------------------------------------------
 module "ecs_service" {
   source = "../../modules/ecs-service"
@@ -246,10 +260,19 @@ module "ecs_service" {
   execution_role_arn = aws_iam_role.execution.arn
   task_role_arn      = aws_iam_role.task.arn
 
-  container_image = "public.ecr.aws/nginx/nginx:latest"
+  container_image = var.container_image
+  container_port  = var.container_port
+  cpu             = var.task_cpu
+  memory          = var.task_memory
 
   subnet_ids         = module.vpc.private_subnets
   security_group_ids = [module.security_groups.ecs_security_group_id]
+
+  # Production deployment safety: always keep 100% of tasks healthy during
+  # rolling updates; allow up to double capacity during the transition.
+  deployment_minimum_healthy_percent  = 100
+  deployment_maximum_percent          = 200
+  health_check_grace_period_seconds   = 120
 
   log_configuration = {
     logDriver = "awslogs"
@@ -268,15 +291,20 @@ module "ecs_service" {
   secrets = module.secrets.ecs_secret_refs
 
   environment_variables = [
-    # DB_HOST is not sensitive — it is the Aurora cluster DNS name.
+    # DB_HOST and DB_READER_HOST are not sensitive — they are DNS names.
     # DB_USERNAME and DB_PASSWORD arrive via secrets (see above).
-    { name = "DB_HOST",       value = module.aurora.cluster_endpoint },
-    { name = "KAFKA_BROKERS", value = "mock-kafka:9092" }
+    { name = "DB_HOST",        value = module.aurora.cluster_endpoint },
+    { name = "DB_READER_HOST", value = module.aurora.reader_endpoint },
+    { name = "KAFKA_BROKERS",  value = var.kafka_brokers }
   ]
 
-  # Dev: relaxed autoscaling ceiling; tighten in prod
-  autoscaling_min_capacity = 1
-  autoscaling_max_capacity = 3
+  # Production: larger autoscaling range, tighter cooldowns
+  autoscaling_min_capacity      = var.autoscaling_min
+  autoscaling_max_capacity      = var.autoscaling_max
+  autoscaling_cpu_threshold     = 70
+  autoscaling_memory_threshold  = 75
+  scale_in_cooldown             = 300
+  scale_out_cooldown            = 60
 
   tags = local.tags
 }
