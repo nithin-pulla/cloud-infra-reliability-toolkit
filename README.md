@@ -1,8 +1,19 @@
 # Cloud Infrastructure Reliability Toolkit
 
-![Terraform](https://img.shields.io/badge/terraform-%235835CC.svg?style=for-the-badge&logo=terraform&logoColor=white)
+![Terraform](https://img.shields.io/badge/Terraform-%235835CC.svg?style=for-the-badge&logo=terraform&logoColor=white)
 ![AWS](https://img.shields.io/badge/AWS-%23FF9900.svg?style=for-the-badge&logo=amazon-aws&logoColor=white)
-![GitHub Actions](https://img.shields.io/badge/github%20actions-%232671E5.svg?style=for-the-badge&logo=githubactions&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-%232671E5.svg?style=for-the-badge&logo=githubactions&logoColor=white)
+![Amazon ECS](https://img.shields.io/badge/Amazon%20ECS-FF9900?style=for-the-badge&logo=amazonecs&logoColor=white)
+![Aurora PostgreSQL](https://img.shields.io/badge/Aurora%20PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)
+![Amazon CloudWatch](https://img.shields.io/badge/CloudWatch-FF4F8B?style=for-the-badge&logo=amazon-cloudwatch&logoColor=white)
+![AWS Secrets Manager](https://img.shields.io/badge/Secrets%20Manager-DD344C?style=for-the-badge&logo=amazonsimpleemailservice&logoColor=white)
+![Amazon S3](https://img.shields.io/badge/Amazon%20S3-569A31?style=for-the-badge&logo=amazons3&logoColor=white)
+![Amazon DynamoDB](https://img.shields.io/badge/DynamoDB-4053D6?style=for-the-badge&logo=amazondynamodb&logoColor=white)
+![Amazon VPC](https://img.shields.io/badge/Amazon%20VPC-8C4FFF?style=for-the-badge&logo=amazon-aws&logoColor=white)
+![ALB](https://img.shields.io/badge/App%20Load%20Balancer-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white)
+![tfsec](https://img.shields.io/badge/tfsec-blue?style=for-the-badge&logo=security&logoColor=white)
+![Checkov](https://img.shields.io/badge/Checkov-brightgreen?style=for-the-badge&logo=checkmarx&logoColor=white)
+![TFLint](https://img.shields.io/badge/TFLint-5C4EE5?style=for-the-badge&logo=terraform&logoColor=white)
 
 A modular Terraform toolkit for provisioning **fault-tolerant, auto-scaling cloud infrastructure** on AWS. Built around production reliability patterns including Multi-AZ redundancy, automated recovery, and infrastructure-as-code reproducibility.
 
@@ -18,6 +29,185 @@ The architecture targets a three-tier topology deployed across three AWS Availab
 - **Compute layer** — ECS Fargate with CPU-based Target Tracking autoscaling
 - **Data layer** — Aurora PostgreSQL with encrypted storage, automated backups, and read-replica failover
 - **Observability layer** — CloudWatch log aggregation with APM integration points
+
+---
+
+## Architecture
+
+### Infrastructure Overview
+
+```mermaid
+graph TD
+    User([👤 User / Client]):::external
+
+    subgraph AWS_Cloud["☁️ AWS Cloud (us-east-1)"]
+
+        subgraph VPC["VPC  10.0.0.0/16  — 3 Availability Zones"]
+
+            subgraph Public["Public Subnets (AZ-a, AZ-b, AZ-c)"]
+                ALB["Application Load Balancer\nHTTPS 443 + HTTP→HTTPS redirect\nTLS 1.2+ · deletion_protection=true"]
+                NAT["NAT Gateway\n(1 per AZ in prod)"]
+            end
+
+            subgraph Private["Private Subnets (AZ-a, AZ-b, AZ-c)"]
+                subgraph ECS_Cluster["ECS Fargate Cluster · Container Insights ON"]
+                    TaskDef["Task Definition\nSecrets injected at launch\nNo plaintext credentials"]
+                    Service["ECS Service\nCircuit Breaker + Auto-Rollback\nmin_healthy=100% max=200%"]
+                    AutoScale["App Auto Scaling\nCPU Target Tracking 70%\nMemory Target Tracking 75%\nMin: 2  Max: 10 (prod)"]
+                end
+            end
+
+            subgraph DB_Subnets["Database Subnets (AZ-a, AZ-b, AZ-c)"]
+                AuroraPrimary[("Aurora PostgreSQL 15.4\nWriter · db.r6g.large\nEncrypted · deletion_protection=true\nPerformance Insights ON")]
+                AuroraReplica[("Aurora Read Replica\nAuto-failover · Enhanced Monitoring")]
+            end
+
+        end
+
+        subgraph Security["Security & Identity"]
+            SecretsDB["Secrets Manager\napp/db/credentials\n{username, password}"]
+            SecretsApp["Secrets Manager\napp/app/secrets\n{jwt_secret, app_key}"]
+            IAMExec["IAM Execution Role\nECSTaskExecutionRolePolicy\n+ secretsmanager:GetSecretValue\n(scoped to env ARNs only)"]
+            IAMTask["IAM Task Role\n(app-level AWS API access)"]
+        end
+
+        subgraph Observability["Observability"]
+            CWLogs["CloudWatch Logs\nRetention: 30 days"]
+            CWAlarms["CloudWatch Alarms\nECS CPU · ECS Memory\nAurora Storage · Connections\nReplica Lag · ALB 5xx"]
+            SNS["SNS Topic\n{app}-alarms\nEmail subscription"]
+        end
+
+        subgraph State["Remote State Backend"]
+            S3["S3 Bucket\nVersioned · AES-256\nPublic access blocked"]
+            DDB["DynamoDB Table\nLockID-based state locking\nPITR enabled"]
+        end
+
+    end
+
+    User -->|HTTPS| ALB
+    ALB -->|Forwards to healthy task IPs\nip-type target group| Service
+    Service --> TaskDef
+    TaskDef -->|DB_HOST env var| AuroraPrimary
+    AuroraPrimary -.->|Storage replication 6-way| AuroraReplica
+    TaskDef -->|awslogs driver| CWLogs
+    TaskDef -->|Outbound via| NAT
+
+    SecretsDB -.->|Injected at task launch| TaskDef
+    SecretsApp -.->|Injected at task launch| TaskDef
+    IAMExec -.->|Pulls secrets| SecretsDB
+    IAMExec -.->|Pulls secrets| SecretsApp
+    IAMExec -.->|Grants| TaskDef
+    IAMTask -.->|App permissions| TaskDef
+
+    AutoScale -.->|Adjusts desired_count| Service
+    CWAlarms -->|Publishes| SNS
+    CWLogs -.->|Metrics feed| CWAlarms
+
+    S3 -.->|Stores tfstate| DDB
+
+    classDef external fill:#f9f,stroke:#333,stroke-width:2px
+```
+
+### Request Flow & Failure Scenarios
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User
+    participant ALB as ALB (3 AZs)
+    participant ECS as ECS Fargate Task
+    participant AS as Auto Scaling
+    participant SM as Secrets Manager
+    participant DB as Aurora PostgreSQL
+    participant CW as CloudWatch
+
+    Note over U,CW: Normal Request Flow
+    U->>ALB: HTTPS (TLS 1.2+ terminates at ALB)
+    ALB->>ECS: Forward to healthy task IP (health-checked)
+    ECS->>DB: SQL via DB_HOST (credentials from Secrets Manager)
+    DB-->>ECS: Query result
+    ECS->>CW: Stream logs (awslogs driver)
+    ECS-->>ALB: HTTP response
+    ALB-->>U: Response
+
+    Note over U,CW: Task Launch — Secret Injection
+    ECS->>SM: GetSecretValue (execution role, scoped ARN)
+    SM-->>ECS: {username, password, jwt_secret}
+    Note over ECS: Credentials in-memory only — not in task def or logs
+
+    Note over U,CW: Traffic Spike
+    U->>ALB: Sustained high traffic
+    AS->>AS: CPU > 70% or Memory > 75%
+    AS->>ECS: Scale out (new tasks, up to max 10)
+    Note over ECS: New tasks launch in ~30s (Fargate)
+    ALB->>ECS: Distribute across all healthy task IPs
+
+    Note over U,CW: Bad Deployment
+    ECS-xECS: New task fails health checks
+    ECS->>ECS: Circuit breaker triggers
+    ECS->>ECS: Auto-rollback to previous task definition
+    ALB->>ECS: Continue routing to stable tasks only
+
+    Note over U,CW: AZ Failure
+    Note over ECS,DB: AZ-a becomes unavailable
+    ALB->>ECS: Stop routing to AZ-a targets automatically
+    DB->>DB: Aurora auto-failover to replica in healthy AZ
+    AS->>ECS: Replace AZ-a tasks in AZ-b / AZ-c
+```
+
+### Module Dependency Graph
+
+```mermaid
+flowchart TD
+    subgraph Composition["examples/dev | examples/prod"]
+        Root["main.tf\n(Composition Root)"]
+    end
+
+    subgraph Modules["Terraform Modules"]
+        VPC["terraform-aws-modules/vpc\n• 3-AZ subnets\n• NAT gateway"]
+        SG["modules/security-groups\n• ALB SG (80/443 inbound)\n• ECS SG (container port from ALB)\n• Aurora SG (5432 from ECS)"]
+        ALBMod["modules/alb\n• ALB (multi-AZ public)\n• HTTPS listener + redirect\n• Health-checked target group"]
+        SecretsMod["modules/secrets\n• DB credentials secret\n• App secrets\n• ecs_secret_refs output"]
+        Aurora["modules/aurora-postgres\n• Multi-AZ cluster\n• Parameter group\n• Enhanced Monitoring IAM"]
+        ECS["modules/ecs-service\n• Task definition\n• ECS service + circuit breaker\n• CPU + memory autoscaling"]
+        Obs["modules/observability\n• CloudWatch Log Group\n• SNS topic + alarms\n• ECS / Aurora / ALB alarms"]
+    end
+
+    subgraph Backend["bootstrap/"]
+        S3B["S3 Bucket\n(tfstate storage)"]
+        DDBL["DynamoDB Table\n(state locking)"]
+    end
+
+    Root --> VPC
+    Root --> SG
+    Root --> ALBMod
+    Root --> SecretsMod
+    Root --> Aurora
+    Root --> ECS
+    Root --> Obs
+
+    VPC -->|public_subnets| ALBMod
+    VPC -->|private_subnets| ECS
+    VPC -->|database_subnet_group| Aurora
+    VPC -->|vpc_id| SG
+
+    SG -->|alb_security_group_id| ALBMod
+    SG -->|ecs_security_group_id| ECS
+    SG -->|aurora_security_group_id| Aurora
+
+    ALBMod -->|target_group_arn| ECS
+    ALBMod -->|lb_arn_suffix + tg_arn_suffix| Obs
+
+    SecretsMod -->|ecs_secret_refs| ECS
+    SecretsMod -->|db_credentials_arn + app_secrets_arn| IAMPolicy["IAM inline policy\n(execution role)"]
+
+    Aurora -->|cluster_endpoint → DB_HOST| ECS
+    Aurora -->|cluster_id| Obs
+
+    Obs -->|log_group_name| ECS
+
+    S3B -.->|backend.tf| Root
+    DDBL -.->|state lock| Root
+```
 
 ---
 
