@@ -1,7 +1,3 @@
-# Backend configuration is in backend.tf.
-# Run `terraform init` after filling in the bucket name and DynamoDB table
-# from the bootstrap workspace output.
-
 terraform {
   required_version = ">= 1.5"
 }
@@ -13,7 +9,7 @@ provider "aws" {
 locals {
   name   = "reliability-toolkit-dev"
   region = var.region
-
+  
   vpc_cidr = "10.0.0.0/16"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
 
@@ -21,15 +17,12 @@ locals {
     Environment = "dev"
     Project     = "reliability-toolkit"
     Terraform   = "true"
-    ManagedBy   = "terraform"
   }
 }
 
 data "aws_availability_zones" "available" {}
 
-# ---------------------------------------------------------------------------
 # Network (VPC)
-# ---------------------------------------------------------------------------
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
@@ -37,206 +30,44 @@ module "vpc" {
   name = local.name
   cidr = local.vpc_cidr
 
-  azs              = local.azs
-  private_subnets  = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k)]
-  public_subnets   = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 4)]
+  azs             = local.azs
+  private_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k)]
+  public_subnets  = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 4)]
   database_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 8)]
 
   enable_nat_gateway = true
-  single_nat_gateway = true # Dev: single NAT to reduce cost. Set false in prod.
-
+  single_nat_gateway = true # Save costs in dev
+  
   create_database_subnet_group = true
 
   tags = local.tags
 }
 
-# ---------------------------------------------------------------------------
-# Security Groups
-# Dedicated security groups replace the default VPC security group.
-# Each layer (ALB, ECS, Aurora) has explicit, least-privilege rules.
-# ---------------------------------------------------------------------------
-module "security_groups" {
-  source = "../../modules/security-groups"
-
-  name_prefix    = local.name
-  vpc_id         = module.vpc.vpc_id
-  container_port = 80
-  tags           = local.tags
-}
-
-# ---------------------------------------------------------------------------
-# Load Balancer
-# Dev: HTTP-only (no certificate_arn). Production sets certificate_arn to
-# an ACM ARN for TLS termination and forces the HTTP→HTTPS redirect.
-# enable_deletion_protection = false allows terraform destroy in dev.
-# ---------------------------------------------------------------------------
-module "alb" {
-  source = "../../modules/alb"
-
-  name_prefix        = local.name
-  vpc_id             = module.vpc.vpc_id
-  public_subnet_ids  = module.vpc.public_subnets
-  security_group_id  = module.security_groups.alb_security_group_id
-  container_port     = 80
-
-  # Dev: defaults to "" (HTTP-only). Override via var.certificate_arn if you
-  # want to test TLS termination in dev with a real ACM certificate.
-  certificate_arn            = var.certificate_arn
-  enable_deletion_protection = false
-
-  health_check_path = "/health"
-
-  tags = local.tags
-}
-
-# ---------------------------------------------------------------------------
 # Observability
-# ---------------------------------------------------------------------------
 module "observability" {
   source = "../../modules/observability"
 
-  app_name  = local.name
-  alarm_email = var.alarm_email
-
-  # ECS alarm dimensions — wired after cluster/service are known
-  ecs_cluster_name = aws_ecs_cluster.this.name
-  ecs_service_name = "${local.name}-service"
-
-  # Aurora alarm dimensions
-  aurora_cluster_id   = module.aurora.cluster_id
-  aurora_has_replicas = false # Dev uses single instance
-
-  # Wire ALB metrics so the 5xx alarm fires correctly.
-  alb_arn_suffix          = module.alb.lb_arn_suffix
-  target_group_arn_suffix = module.alb.target_group_arn_suffix
-
-  tags = local.tags
+  app_name = local.name
+  tags     = local.tags
 }
 
-# ---------------------------------------------------------------------------
-# Secrets Manager
-# Stores DB credentials and app secrets; ECS pulls them at task launch so
-# no plaintext credentials ever appear in the task definition or logs.
-#
-# recovery_window_in_days = 0 allows immediate secret deletion on
-# `terraform destroy` in dev. Set to 7–30 in production.
-# ---------------------------------------------------------------------------
-module "secrets" {
-  source = "../../modules/secrets"
-
-  app_name    = local.name
-  db_username = "postgres"
-  db_password = var.db_password
-
-  recovery_window_in_days = 0 # Dev: force-delete on destroy
-
-  tags = local.tags
-}
-
-# ---------------------------------------------------------------------------
 # Database
-# ---------------------------------------------------------------------------
 module "aurora" {
   source = "../../modules/aurora-postgres"
 
   cluster_name           = "${local.name}-db"
   db_name                = "appdb"
   master_username        = "postgres"
-  master_password        = var.db_password
-  vpc_security_group_ids = [module.security_groups.aurora_security_group_id]
+  master_password        = var.db_password # In real life, use Secrets Manager
+  vpc_security_group_ids = [module.vpc.default_security_group_id]
   db_subnet_group_name   = module.vpc.database_subnet_group_name
-
-  # Dev overrides: reduce cost and allow teardown
-  instance_count              = 1
-  deletion_protection         = false # Allow terraform destroy in dev
-  skip_final_snapshot         = true
-  monitoring_interval         = 0     # Disable enhanced monitoring in dev
-  performance_insights_enabled = false # Disable to reduce cost in dev
+  instance_count         = 1 # Dev Mode
+  skip_final_snapshot    = true
 
   tags = local.tags
 }
 
-# ---------------------------------------------------------------------------
-# ECS Cluster
-# Container Insights enabled for memory, network, and disk metrics per task.
-# ---------------------------------------------------------------------------
-resource "aws_ecs_cluster" "this" {
-  name = local.name
-
-  setting {
-    name  = "containerInsights"
-    value = "enabled"
-  }
-
-  tags = local.tags
-}
-
-# ---------------------------------------------------------------------------
-# IAM — Task Execution Role
-# Grants ECS the ability to pull images from ECR and write logs to CloudWatch.
-# ---------------------------------------------------------------------------
-resource "aws_iam_role" "execution" {
-  name = "${local.name}-execution-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
-    }]
-  })
-  tags = local.tags
-}
-
-resource "aws_iam_role_policy_attachment" "execution" {
-  role       = aws_iam_role.execution.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
-}
-
-# Least-privilege: grant the execution role access to exactly the two secrets
-# this environment owns. The ECS agent (not the application) uses this role
-# to fetch secrets and inject them into the task at launch time.
-resource "aws_iam_role_policy" "execution_secrets" {
-  name = "${local.name}-secrets-access"
-  role = aws_iam_role.execution.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AllowSecretsManagerAccess"
-        Effect = "Allow"
-        Action = ["secretsmanager:GetSecretValue"]
-        Resource = [
-          module.secrets.db_credentials_secret_arn,
-          module.secrets.app_secrets_arn,
-        ]
-      }
-    ]
-  })
-}
-
-# ---------------------------------------------------------------------------
-# IAM — Task Role (Application Role)
-# Grants the running container permissions to call AWS APIs. Scoped to only
-# what the application actually needs. Extend with additional policy
-# attachments for S3, SQS, Secrets Manager, etc. as required.
-# ---------------------------------------------------------------------------
-resource "aws_iam_role" "task" {
-  name = "${local.name}-task-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
-    }]
-  })
-  tags = local.tags
-}
-
-# ---------------------------------------------------------------------------
 # ECS Service
-# ---------------------------------------------------------------------------
 module "ecs_service" {
   source = "../../modules/ecs-service"
 
@@ -244,12 +75,11 @@ module "ecs_service" {
   cluster_id         = aws_ecs_cluster.this.id
   cluster_name       = aws_ecs_cluster.this.name
   execution_role_arn = aws_iam_role.execution.arn
-  task_role_arn      = aws_iam_role.task.arn
-
-  container_image = "public.ecr.aws/nginx/nginx:latest"
-
+  
+  container_image = "public.ecr.aws/nginx/nginx:latest" # Example
+  
   subnet_ids         = module.vpc.private_subnets
-  security_group_ids = [module.security_groups.ecs_security_group_id]
+  security_group_ids = [module.vpc.default_security_group_id]
 
   log_configuration = {
     logDriver = "awslogs"
@@ -260,23 +90,33 @@ module "ecs_service" {
     }
   }
 
-  # Wire the ALB target group so ECS registers task IPs as targets.
-  target_group_arn = module.alb.target_group_arn
-
-  # DB credentials and app secrets are injected at launch time by the ECS
-  # agent via Secrets Manager — never stored in plaintext in the task def.
-  secrets = module.secrets.ecs_secret_refs
-
   environment_variables = [
-    # DB_HOST is not sensitive — it is the Aurora cluster DNS name.
-    # DB_USERNAME and DB_PASSWORD arrive via secrets (see above).
-    { name = "DB_HOST",       value = module.aurora.cluster_endpoint },
-    { name = "KAFKA_BROKERS", value = "mock-kafka:9092" }
+    { name = "DB_HOST", value = module.aurora.cluster_endpoint },
+    { name = "KAFKA_BROKERS", value = "mock-kafka:9092" } # Mocked dependency
   ]
 
-  # Dev: relaxed autoscaling ceiling; tighten in prod
-  autoscaling_min_capacity = 1
-  autoscaling_max_capacity = 3
-
   tags = local.tags
+}
+
+resource "aws_ecs_cluster" "this" {
+  name = local.name
+  tags = local.tags
+}
+
+# IAM Roles (Simplified for example)
+resource "aws_iam_role" "execution" {
+  name = "${local.name}-execution-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "execution" {
+  role       = aws_iam_role.execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
