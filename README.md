@@ -358,6 +358,535 @@ terraform apply
 
 ---
 
+## Integrating Your Application
+
+This section walks through every step required to deploy a real application using this toolkit — from a fresh AWS account to a running, HTTPS-accessible service with secrets management, autoscaling, and observability wired in.
+
+---
+
+### Step 1 — Prerequisites
+
+Install and configure the following tools before you begin.
+
+**Terraform**
+
+```bash
+# macOS
+brew install terraform
+
+# Linux (via tfenv for version pinning)
+git clone https://github.com/tfutils/tfenv.git ~/.tfenv
+echo 'export PATH="$HOME/.tfenv/bin:$PATH"' >> ~/.bashrc
+tfenv install 1.9.0
+tfenv use 1.9.0
+```
+
+**AWS CLI**
+
+```bash
+# macOS
+brew install awscli
+
+# Verify credentials are configured
+aws sts get-caller-identity
+```
+
+**Docker** — Required to build and push your application image.
+
+```bash
+# macOS
+brew install --cask docker
+```
+
+**Required IAM permissions for the deploying identity:**
+
+The AWS identity running `terraform apply` needs the following actions. Attach these via an IAM policy or use an admin role in sandbox/dev accounts.
+
+```
+ec2:* (VPC, subnets, security groups, NAT gateway, EIP)
+ecs:*
+rds:*
+elasticloadbalancing:*
+secretsmanager:*
+iam:CreateRole, iam:AttachRolePolicy, iam:PutRolePolicy, iam:PassRole
+logs:*
+application-autoscaling:*
+s3:* (bootstrap bucket only)
+dynamodb:* (lock table only)
+```
+
+---
+
+### Step 2 — Bootstrap the Remote State Backend
+
+This is a **one-time, per-AWS-account** step. It provisions the S3 bucket and DynamoDB table that all subsequent Terraform workspaces use for remote state storage and locking.
+
+```bash
+cd bootstrap/
+
+# Choose a globally unique bucket name (e.g. acme-tfstate-prod-123456)
+terraform init
+
+terraform apply \
+  -var="bucket_name=<your-globally-unique-bucket-name>" \
+  -var="region=us-east-1"
+```
+
+Note the outputs — you will need the `state_bucket_name` value in the next step.
+
+```
+Outputs:
+  state_bucket_name  = "acme-tfstate-prod-123456"
+  dynamodb_table_name = "terraform-state-lock"
+```
+
+> Skip this step if a shared state bucket already exists in your AWS account. Ask your platform team for the bucket name and DynamoDB table name.
+
+---
+
+### Step 3 — Create an ECR Repository for Your Application Image
+
+Each application needs an ECR repository to push container images that ECS will pull from.
+
+```bash
+# Replace <app-name> with your application name (e.g. payments-api)
+aws ecr create-repository \
+  --repository-name <app-name> \
+  --region us-east-1 \
+  --image-scanning-configuration scanOnPush=true \
+  --encryption-configuration encryptionType=AES256
+
+# Note the repositoryUri from the output, e.g.:
+# 123456789012.dkr.ecr.us-east-1.amazonaws.com/payments-api
+```
+
+---
+
+### Step 4 — Build and Push Your Application Image
+
+Your application must run as a Docker container. The ECS task definition expects the container to:
+
+- Listen on a single TCP port (default `80`; configurable via `container_port`)
+- Write all logs to **stdout/stderr** (the `awslogs` driver forwards them to CloudWatch)
+- Expose a **health check endpoint** at `/health` that returns HTTP `200` when the process is ready to serve traffic
+
+```bash
+# Authenticate Docker to ECR
+aws ecr get-login-password --region us-east-1 \
+  | docker login --username AWS \
+    --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+
+# Build and tag your image
+docker build -t <app-name>:latest .
+docker tag <app-name>:latest \
+  123456789012.dkr.ecr.us-east-1.amazonaws.com/<app-name>:latest
+
+# Push to ECR
+docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/<app-name>:latest
+```
+
+**Health endpoint requirements:**
+
+The ALB health check hits `/health` every 30 seconds. The endpoint must return a `2xx` status code. ECS marks a task as unhealthy (and replaces it) after 3 consecutive failures. A minimal implementation in any language:
+
+```python
+# FastAPI / Python example
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+```
+
+```javascript
+// Express / Node.js example
+app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
+```
+
+```go
+// net/http / Go example
+http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
+})
+```
+
+---
+
+### Step 5 — Configure the Backend
+
+Open the `backend.tf` in your target environment and substitute the real bucket name from Step 2.
+
+**`examples/dev/backend.tf`** (or `examples/prod/backend.tf`):
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "acme-tfstate-prod-123456"   # ← your bucket name
+    key            = "reliability-toolkit/dev/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "terraform-state-lock"
+  }
+}
+```
+
+> The `key` path is the location of the state file inside the bucket. Each environment must use a unique key to avoid state collisions.
+
+---
+
+### Step 6 — Configure Your Application Variables
+
+Create a `terraform.tfvars` file in the environment directory. **Never commit this file** — it is already listed in `.gitignore`.
+
+**`examples/dev/terraform.tfvars`:**
+
+```hcl
+region      = "us-east-1"
+db_password = "a-strong-random-password-here"
+```
+
+**`examples/prod/terraform.tfvars`:**
+
+```hcl
+region          = "us-east-1"
+db_password     = "a-different-strong-password"
+certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/abc123"
+```
+
+> For the `certificate_arn`: request or import an ACM certificate via the [AWS Console](https://console.aws.amazon.com/acm) or CLI. The certificate must be in the **same region** as the ALB and must be in `Issued` state before `terraform apply`.
+
+---
+
+### Step 7 — Point the ECS Service at Your Image
+
+In `examples/dev/main.tf` (or `examples/prod/main.tf`), update the `container_image` argument inside the `module "ecs_service"` block with the ECR URI from Step 3:
+
+```hcl
+module "ecs_service" {
+  source = "../../modules/ecs-service"
+
+  # Replace this line:
+  container_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/<app-name>:latest"
+
+  container_port    = 8080  # the port your app listens on
+  health_check_path = "/health"
+
+  # ... rest of the block unchanged
+}
+```
+
+Also update the `container_port` in `module "security_groups"` and `module "alb"` to match:
+
+```hcl
+module "security_groups" {
+  # ...
+  container_port = 8080
+}
+
+module "alb" {
+  # ...
+  container_port    = 8080
+  health_check_path = "/health"
+}
+```
+
+---
+
+### Step 8 — Configure Application Secrets
+
+The toolkit provisions two Secrets Manager secrets per environment. Any value your application needs at runtime that should not appear in source code or state files goes here.
+
+**In `main.tf`, update the `module "secrets"` block:**
+
+```hcl
+module "secrets" {
+  source = "../../modules/secrets"
+
+  app_name    = local.name
+  db_username = "postgres"
+  db_password = var.db_password
+  db_host     = module.aurora.cluster_endpoint
+  db_name     = "appdb"
+
+  # Add your application-level secrets here.
+  # These are stored as a JSON object at <app_name>/app/secrets in Secrets Manager.
+  app_secrets = {
+    jwt_secret      = "change-me-at-apply-time"
+    stripe_api_key  = "sk_live_..."
+    internal_api_key = "..."
+  }
+
+  tags = local.tags
+}
+```
+
+At task launch, ECS injects these as `DB_CREDENTIALS` and `APP_SECRETS` environment variables containing the full JSON payloads. Parse them in your application startup code:
+
+```python
+# Python example — read at startup, not on every request
+import json, os
+
+db_creds = json.loads(os.environ["DB_CREDENTIALS"])
+DB_HOST     = os.environ.get("DB_HOST")
+DB_USER     = db_creds["username"]
+DB_PASSWORD = db_creds["password"]
+
+app_secrets = json.loads(os.environ["APP_SECRETS"])
+JWT_SECRET  = app_secrets["jwt_secret"]
+```
+
+```javascript
+// Node.js example
+const dbCreds   = JSON.parse(process.env.DB_CREDENTIALS);
+const appSecrets = JSON.parse(process.env.APP_SECRETS);
+```
+
+> The ECS execution role already has `secretsmanager:GetSecretValue` scoped to exactly these two secret ARNs — no additional IAM changes are needed.
+
+---
+
+### Step 9 — Add Environment Variables
+
+For non-sensitive runtime configuration (feature flags, external service URLs, log levels), use the `environment_variables` list in the `module "ecs_service"` block. These values are visible in the task definition and Terraform state, so keep secrets in Secrets Manager (Step 8).
+
+```hcl
+module "ecs_service" {
+  # ...
+  environment_variables = [
+    { name = "DB_HOST",       value = module.aurora.cluster_endpoint },
+    { name = "DB_READER_HOST", value = module.aurora.reader_endpoint },
+    { name = "LOG_LEVEL",     value = "info" },
+    { name = "APP_ENV",       value = "dev" },
+    { name = "PORT",          value = "8080" },
+  ]
+}
+```
+
+---
+
+### Step 10 — Initialize and Plan
+
+```bash
+cd examples/dev   # or examples/prod
+
+# Download providers and modules; connect to the remote backend
+terraform init
+
+# Validate HCL syntax and module references
+terraform validate
+
+# Preview every resource that will be created, modified, or destroyed
+terraform plan -out=tfplan
+```
+
+Review the plan output before applying. Key things to verify:
+
+- The correct container image URI appears in the task definition
+- Security group rules match the expected port
+- Aurora instance count is what you expect (`1` for dev, `>= 2` for prod)
+- No unexpected destroys on existing resources (especially in prod)
+
+---
+
+### Step 11 — Apply
+
+```bash
+terraform apply tfplan
+```
+
+Terraform provisions resources in dependency order. The full apply for a net-new environment typically takes **8–12 minutes** — the majority of this time is Aurora cluster initialization.
+
+When complete, Terraform prints the outputs:
+
+```
+Outputs:
+  alb_dns_name       = "reliability-toolkit-dev-1234567890.us-east-1.elb.amazonaws.com"
+  cluster_name       = "reliability-toolkit-dev"
+  service_name       = "reliability-toolkit-dev-service"
+  db_endpoint        = "reliability-toolkit-dev-db.cluster-xyz.us-east-1.rds.amazonaws.com"
+  log_group_name     = "/ecs/reliability-toolkit-dev-logs"
+```
+
+---
+
+### Step 12 — Verify the Deployment
+
+**Check the ECS service is stable:**
+
+```bash
+aws ecs describe-services \
+  --cluster reliability-toolkit-dev \
+  --services reliability-toolkit-dev-service \
+  --region us-east-1 \
+  --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount,Events:events[0:3]}'
+```
+
+Expect `runningCount == desiredCount` and `status: ACTIVE`.
+
+**Tail application logs:**
+
+```bash
+aws logs tail /ecs/reliability-toolkit-dev-logs \
+  --follow \
+  --region us-east-1
+```
+
+**Hit the health endpoint via the ALB:**
+
+```bash
+curl http://reliability-toolkit-dev-1234567890.us-east-1.elb.amazonaws.com/health
+# Expected: {"status":"ok"}
+```
+
+For production with HTTPS, use your custom domain (after pointing DNS to the ALB):
+
+```bash
+curl https://api.yourdomain.com/health
+```
+
+**Inspect target health (confirm ECS tasks are registered):**
+
+```bash
+# Get the target group ARN from Terraform output or the console
+aws elbv2 describe-target-health \
+  --target-group-arn <target-group-arn> \
+  --region us-east-1 \
+  --query 'TargetHealthDescriptions[*].{IP:Target.Id,Port:Target.Port,State:TargetHealth.State}'
+```
+
+All targets should show `State: healthy`.
+
+---
+
+### Step 13 — Point DNS to the ALB (Production)
+
+In your DNS provider (Route 53, Cloudflare, etc.), create an **Alias** or **CNAME** record pointing your domain to the ALB DNS name from the Terraform output.
+
+**Route 53 example:**
+
+```bash
+# Get the ALB hosted zone ID
+aws elbv2 describe-load-balancers \
+  --names reliability-toolkit-prod \
+  --query 'LoadBalancers[0].CanonicalHostedZoneId'
+
+# Then create an A-record alias in the Route 53 console or via CLI:
+aws route53 change-resource-record-sets \
+  --hosted-zone-id <your-hosted-zone-id> \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "api.yourdomain.com",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "<alb-hosted-zone-id>",
+          "DNSName": "<alb-dns-name>",
+          "EvaluateTargetHealth": true
+        }
+      }
+    }]
+  }'
+```
+
+---
+
+### Step 14 — Day-2 Operations
+
+#### Deploying a New Application Version
+
+Build, tag, and push the new image to ECR (Step 4). Then force a new ECS deployment — the service pulls the latest image from ECR:
+
+```bash
+aws ecs update-service \
+  --cluster reliability-toolkit-dev \
+  --service reliability-toolkit-dev-service \
+  --force-new-deployment \
+  --region us-east-1
+```
+
+The ECS deployment circuit breaker automatically rolls back to the previous task definition if the new tasks fail to become healthy.
+
+If you change CPU, memory, environment variables, or the image URI in `main.tf`, run `terraform apply` instead — Terraform will register a new task definition revision and trigger a rolling deployment.
+
+#### Rotating Secrets
+
+Secrets Manager credentials can be rotated without a Terraform apply. The `lifecycle.ignore_changes` rule on `secret_string` prevents Terraform from reverting your rotation.
+
+```bash
+# Update the database password directly in Secrets Manager
+aws secretsmanager put-secret-value \
+  --secret-id reliability-toolkit-dev/db/credentials \
+  --secret-string '{"username":"postgres","password":"new-strong-password","host":"...","port":5432,"dbname":"appdb"}' \
+  --region us-east-1
+```
+
+After updating the secret, force a new ECS deployment (see above) so running tasks pick up the new credentials at their next launch.
+
+#### Scaling
+
+Change `desired_count`, `autoscaling_min_capacity`, or `autoscaling_max_capacity` in `main.tf` and run `terraform apply`. For an immediate manual scale-out:
+
+```bash
+aws ecs update-service \
+  --cluster reliability-toolkit-prod \
+  --service reliability-toolkit-prod-service \
+  --desired-count 4 \
+  --region us-east-1
+```
+
+#### Viewing Alarms and Logs
+
+```bash
+# List all alarms for the environment
+aws cloudwatch describe-alarms \
+  --alarm-name-prefix reliability-toolkit-dev \
+  --region us-east-1 \
+  --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue}'
+
+# Stream ECS logs
+aws logs tail /ecs/reliability-toolkit-dev-logs --follow --region us-east-1
+```
+
+---
+
+### Step 15 — Tearing Down an Environment
+
+```bash
+cd examples/dev
+
+# Preview what will be destroyed
+terraform plan -destroy
+
+# Destroy all resources in the environment
+terraform destroy
+```
+
+> Aurora skips the final snapshot when `skip_final_snapshot = true` (dev default). In production, `skip_final_snapshot = false` and `deletion_protection = true` are set — you must manually disable deletion protection in the RDS console before `terraform destroy` will succeed. This is intentional.
+
+The `bootstrap/` workspace is intentionally never destroyed via Terraform — the state bucket has `lifecycle { prevent_destroy = true }`. Delete it manually via the AWS console only after all environment state has been migrated away.
+
+---
+
+### Quick Reference: End-to-End Checklist
+
+```
+[ ] Step 1  — Install Terraform, AWS CLI, Docker; configure IAM credentials
+[ ] Step 2  — Run terraform apply in bootstrap/ to create state bucket + DynamoDB table
+[ ] Step 3  — Create an ECR repository for your application image
+[ ] Step 4  — Build, tag, and push your Docker image to ECR
+[ ] Step 5  — Set state bucket name in examples/<env>/backend.tf
+[ ] Step 6  — Create examples/<env>/terraform.tfvars with db_password (+ certificate_arn for prod)
+[ ] Step 7  — Set container_image, container_port, and health_check_path in main.tf
+[ ] Step 8  — Add application secrets to module "secrets" → app_secrets map in main.tf
+[ ] Step 9  — Add non-sensitive config to environment_variables list in main.tf
+[ ] Step 10 — Run terraform init && terraform validate && terraform plan
+[ ] Step 11 — Run terraform apply
+[ ] Step 12 — Verify: ECS service healthy, logs streaming, ALB /health returns 200
+[ ] Step 13 — Create DNS alias record pointing your domain to the ALB (prod)
+[ ] Step 14 — Set up log alerts, secret rotation schedule, and deployment pipeline
+```
+
+---
+
 ## Repository Structure
 
 ```

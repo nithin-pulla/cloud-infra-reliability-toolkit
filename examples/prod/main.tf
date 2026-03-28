@@ -7,14 +7,14 @@ provider "aws" {
 }
 
 locals {
-  name   = "reliability-toolkit-dev"
+  name   = "reliability-toolkit-prod"
   region = var.region
 
-  vpc_cidr = "10.0.0.0/16"
+  vpc_cidr = "10.1.0.0/16"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
 
   tags = {
-    Environment = "dev"
+    Environment = "prod"
     Project     = "reliability-toolkit"
     Terraform   = "true"
   }
@@ -36,7 +36,7 @@ module "vpc" {
   database_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 8)]
 
   enable_nat_gateway = true
-  single_nat_gateway = true # Save costs in dev
+  single_nat_gateway = false # One NAT GW per AZ for HA
 
   create_database_subnet_group = true
 
@@ -57,8 +57,9 @@ module "security_groups" {
 module "observability" {
   source = "../../modules/observability"
 
-  app_name = local.name
-  tags     = local.tags
+  app_name       = local.name
+  retention_days = 90
+  tags           = local.tags
 }
 
 # Database
@@ -71,8 +72,8 @@ module "aurora" {
   master_password        = var.db_password
   vpc_security_group_ids = [module.security_groups.aurora_sg_id]
   db_subnet_group_name   = module.vpc.database_subnet_group_name
-  instance_count         = 1 # Dev mode
-  skip_final_snapshot    = true
+  instance_count         = 2 # Writer + Reader for HA
+  skip_final_snapshot    = false
 
   tags = local.tags
 }
@@ -88,7 +89,7 @@ module "secrets" {
   db_name     = "appdb"
   app_secrets = {}
 
-  recovery_window_in_days = 0 # Immediate deletion for dev
+  recovery_window_in_days = 30
 
   tags = local.tags
 }
@@ -103,7 +104,9 @@ module "alb" {
   alb_sg_id         = module.security_groups.alb_sg_id
   container_port    = 80
   health_check_path = "/health"
-  certificate_arn   = "" # HTTP-only in dev
+  certificate_arn   = var.certificate_arn # HTTPS enforced in prod
+
+  enable_deletion_protection = true
 
   tags = local.tags
 }
@@ -163,6 +166,10 @@ module "ecs_service" {
 
   container_image = "public.ecr.aws/nginx/nginx:latest"
 
+  desired_count            = 2
+  autoscaling_min_capacity = 2
+  autoscaling_max_capacity = 10
+
   subnet_ids         = module.vpc.private_subnets
   security_group_ids = [module.security_groups.ecs_sg_id]
   target_group_arn   = module.alb.target_group_arn
@@ -178,7 +185,7 @@ module "ecs_service" {
 
   environment_variables = [
     { name = "DB_HOST", value = module.aurora.cluster_endpoint },
-    { name = "KAFKA_BROKERS", value = "mock-kafka:9092" }, # Mocked dependency
+    { name = "DB_READER_HOST", value = module.aurora.reader_endpoint },
   ]
 
   secrets = module.secrets.ecs_secret_refs
